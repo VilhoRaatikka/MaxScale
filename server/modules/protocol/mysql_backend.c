@@ -580,7 +580,6 @@ static int gw_error_backend_event(DCB *dcb) {
                         1,
                         0,
                         "Writing to backend failed.");
-                ss_dassert(false);
                 
                 rc = 0;
         } else {
