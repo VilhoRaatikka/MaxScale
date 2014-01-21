@@ -453,8 +453,12 @@ int             rc;
 	}
 	memcpy(&(dcb->func), funcs, sizeof(GWPROTOCOL));
 
-        /*<
+        /**
          * Link dcb to session. Unlink is called in dcb_final_free
+         */
+        /**
+         * in session_link_dcb dcb_pending_sescmd is set to the first item of
+         * session->ses_command_list
          */
 	if (!session_link_dcb(session, dcb))
 	{
@@ -495,12 +499,26 @@ int             rc;
                         session->client->fd)));
         }
         ss_dassert(dcb->fd == -1); /*< must be uninitialized at this point */
-        /*<
+        /**
          * Successfully connected to backend. Assign file descriptor to dcb
          */
         dcb->fd = fd;
 
-	/*<
+        /**
+         * TODO : Check if DCB has all SET SESSION <variable> commands executed.
+         * If not, execute them all, or if not executed here, mark DCB stale.
+         * Alternative is to check pending session commands in epoll_wait loop
+         * and so that they would always be executed before first client query.
+         *
+         * Replay every session command which is in other state than SES_CMD_INIT.
+         * Lock session for the duration of moving forward on the list. When the
+         * last cmd is executed lock session and check list again and if it is
+         * empty, mark DCB up-to-date and release the lock.
+         * 
+         * vraa 20.1.14
+         */
+        
+	/**
 	 * backend_dcb is connected to backend server, and once backend_dcb
          * is added to poll set, authentication takes place as part of 
 	 * EPOLLOUT event that will be received once the connection
@@ -1301,3 +1319,129 @@ int gw_write(
         return w;
 }
 
+#if defined(SES_CMD)
+bool dcb_add_sescmd(
+        DCB*           dcb,
+        ses_command_t* sescmd)
+{
+        bool succp = false;
+
+        if (dcb == NULL)
+        {
+                goto return_succp;
+        }
+        CHK_DCB(dcb);
+
+        if (sescmd == NULL)
+        {
+                goto return_succp;
+        }
+        CHK_SES_CMD(sescmd);
+        /**
+         * DCB can handle single session variable command at the time. Thus, 
+         * existing session command must be processed in this connection before
+         * it can be replaced.
+         */
+        ss_dassert(dcb->dcb_sescmd == NULL ||
+                   dcb->dcb_sescmd->ses_cmd_state == SES_CMD_REPLIED_WHILE_SENDING ||
+                   dcb->dcb_sescmd->ses_cmd_state == SES_CMD_SENT_AND_REPLIED);
+
+        if (dcb->dcb_sescmd == NULL ||
+                   dcb->dcb_sescmd->ses_cmd_state == SES_CMD_REPLIED_WHILE_SENDING ||
+                   dcb->dcb_sescmd->ses_cmd_state == SES_CMD_SENT_AND_REPLIED)
+        {
+            dcb->dcb_sescmd = sescmd;
+            succp = true;
+        }
+return_succp:
+        return succp;
+}
+
+
+bool dcb_remove_sescmd(
+        DCB* dcb)
+{
+        bool           succp = false;
+        ses_command_t* sescmd;
+
+        if (dcb == NULL)
+        {
+                goto return_succp;
+        }
+        CHK_DCB(dcb);
+        sescmd = dcb->dcb_sescmd;
+        
+        if (sescmd == NULL)
+        {
+                goto return_succp;
+        }
+        CHK_SES_CMD(sescmd);
+        ss_dassert(sescmd->ses_cmd_state == SES_CMD_REPLIED_WHILE_SENDING ||
+                   sescmd->ses_cmd_state == SES_CMD_SENT_AND_REPLIED);
+        
+        dcb->dcb_sescmd = NULL;
+        succp = true;
+        
+return_succp:
+        return succp;
+}
+/**
+ * If dcb has session variable command it means that it is replying ses cmd to
+ * client.
+ */
+bool dcb_is_replying_sescmd(
+        DCB* dcb)
+{
+        ses_command_t* sc;
+        bool           succp = false;
+
+        if (dcb == NULL)
+        {
+                goto return_succp;
+        }
+        CHK_DCB(dcb);
+        sc = dcb->dcb_sescmd;
+
+        if (sc == NULL)
+        {
+                goto return_succp;
+        }
+        CHK_SES_CMD(sc);
+        succp = true;
+
+return_succp:
+        return succp;
+}
+
+
+bool dcb_sescmd_can_be_replied(
+        DCB* dcb)
+{
+        bool           succp = false;
+        ses_command_t* sc;
+        
+        if (dcb == NULL)
+        {
+            goto return_succp;
+        }
+        CHK_DCB(dcb);
+        sc = dcb->dcb_sescmd;
+
+        if (sc == NULL)
+        {
+            goto return_succp;
+        }
+        CHK_SES_CMD(sc);
+        
+        if (sc->ses_cmd_state == SES_CMD_SENDING ||
+            sc->ses_cmd_state == SES_CMD_SENT)
+        {
+            succp = true;
+        }
+        
+return_succp:
+        return succp;
+}
+         
+
+#endif /* SES_CMD */

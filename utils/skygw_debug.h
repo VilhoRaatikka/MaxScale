@@ -117,7 +117,8 @@ typedef enum skygw_chk_t {
     CHK_NUM_DCB,
     CHK_NUM_PROTOCOL,
     CHK_NUM_SESSION,
-    CHK_NUM_ROUTER_SES
+    CHK_NUM_ROUTER_SES,
+    CHK_NUM_SES_CMD
 } skygw_chk_t;
 
 # define STRBOOL(b) ((b) ? "true" : "false")
@@ -428,6 +429,14 @@ typedef enum skygw_chk_t {
                                 "Router client session has invalid check fields"); \
         }
 
+#define CHK_SES_CMD(s) {                                                \
+                ss_info_dassert((s)->ses_cmd_chk_top == CHK_NUM_SES_CMD && \
+                                (s)->ses_cmd_chk_tail == CHK_NUM_SES_CMD && \
+                                (s)->ses_cmd_state >= SES_CMD_INIT &&   \
+                                (s)->ses_cmd_state <= SES_CMD_SENT_AND_REPLIED, \
+                                "Session variable command has invalid check fields " \
+                                "or state");                            \
+        }
 
 #if defined(SS_DEBUG)
 bool conn_open[10240];

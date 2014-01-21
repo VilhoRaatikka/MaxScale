@@ -40,8 +40,8 @@
 #include <spinlock.h>
 #include <atomic.h>
 #include <skygw_utils.h>
+#include <skygw_debug.h>
 #include <log_manager.h>
-
 extern int lm_enabled_logfiles_bitmask;
 
 static SPINLOCK	session_spin = SPINLOCK_INIT;
@@ -438,3 +438,255 @@ session_state(int state)
 		return "Invalid State";
 	}
 }
+
+/** 
+ * @node Initialize session variable command structure 
+ *
+ * Parameters:
+ * @param cmdstr - pointer to command string of type GWBUF
+ *         
+ *
+ * @return Initialized session variable command structure or NULL in
+ * case of error.
+ *
+ * 
+ * @details Memory allocation is done with calloc but could be optimized
+ * by using small preallocated set of memory chunks and recycling them.
+ * It is not very likely that different set commands are executed
+ * in large scale. Redundant autocommit=xxx calls can be reduced to one, which
+ * makes it possible to recycle buffers.
+ *
+ */
+#if defined(SES_CMD)
+ses_command_t* ses_command_init(
+        SESSION* ses,
+        GWBUF*   cmdstr)
+{
+        ses_command_t* sc = NULL;
+        CHK_SESSION(ses);
+        
+        if (cmdstr == NULL || ses == NULL)
+        {
+                LOGIF(LE, (skygw_log_write_flush(
+                                   LOGFILE_ERROR,
+                                   (ses == NULL ?
+                                    "Error : Session pointer is NULL." :
+                                    "Error : Session command pointer is NULL."))));
+                goto return_sc;
+        }
+        
+        CHK_GWBUF(cmdstr);
+        sc = (ses_command_t*)calloc(1, sizeof(ses_command_t));
+        
+        if (sc == NULL)
+        {
+                LOGIF(LE, (skygw_log_write_flush(
+                                   LOGFILE_ERROR,
+                                   "Error : Failed to allocate memory for "
+                                   "session command object.")));
+                goto return_sc;
+        }
+#if defined(SS_DEBUG)
+        sc->ses_cmd_chk_top  = CHK_NUM_SES_CMD;
+        sc->ses_cmd_chk_tail = CHK_NUM_SES_CMD;
+#endif
+        sc->ses_cmd_state = SES_CMD_INIT;
+        sc->ses_cmd_session = ses;
+        spinlock_init(&sc->ses_cmd_lock);
+        sc->ses_cmd_buf = cmdstr;
+        CHK_SES_CMD(sc);
+return_sc:
+        return sc;
+}
+
+/** 
+ * @node Link session variable command to sessions list of them 
+ *
+ * Parameters:
+ * @param sc command struct
+ *
+ * @return void
+ *
+ */
+void ses_add_sescmd(
+        ses_command_t* sc)
+{
+        ses_command_t** p_sc = &sc->ses_cmd_session->ses_sesvar_cmds;
+        
+        CHK_SES_CMD(sc);
+        CHK_SESSION(sc->ses_cmd_session);
+        
+        spinlock_acquire(&sc->ses_cmd_session->ses_lock);
+        if (*p_sc == NULL)
+        {
+                *p_sc = sc;
+        }
+        else
+        {
+                while ((*p_sc)->ses_cmd_next != NULL)
+                {
+                        *p_sc = (*p_sc)->ses_cmd_next;
+                }
+                (*p_sc)->ses_cmd_next = sc;
+        }
+        sc->ses_cmd_state = SES_CMD_SAVED;
+        spinlock_release(&sc->ses_cmd_session->ses_lock);
+}
+
+
+ses_cmd_state_t ses_sescmd_get_next_state(
+        ses_cmd_state_t curr_state)
+{
+        ses_cmd_state_t new_state;
+        ss_dassert(curr_state >= SES_CMD_INIT &&
+                   curr_state <= SES_CMD_SENT_AND_REPLIED);
+
+        switch (curr_state) {
+
+        case SES_CMD_INIT:
+                new_state = SES_CMD_SAVED;
+                break;
+                
+        case SES_CMD_SAVED:
+                new_state = SES_CMD_SENDING;
+                break;
+                
+        case SES_CMD_SENDING:
+                /**< Error - undeterministic transition */
+                goto return_curr;
+                break;
+                
+        case SES_CMD_SENT:
+                new_state = SES_CMD_SENT_AND_REPLIED;
+                break;
+
+        case SES_CMD_REPLIED_WHILE_SENDING:
+                new_state = SES_CMD_SENT_AND_REPLIED;
+                break;
+
+        default:
+                /* Error, illegal state */
+                goto return_curr;
+                break;
+        } /* switch */
+
+        return new_state;
+return_curr:
+        return curr_state;
+}
+
+
+bool ses_sescmd_proceed_to_nolock(
+        ses_command_t*  sc,
+        ses_cmd_state_t next)
+{
+        bool             succp = false;
+        ses_cmd_state_t* curr;
+
+        curr = &sc->ses_cmd_state;
+
+        /**
+         * if next state is INIT it indicates that deterministic step can be
+         * taken and the next state is determined by state machine.
+         */
+        if (next == SES_CMD_INIT)
+        {
+                next = ses_sescmd_get_next_state(*curr);
+        }
+        
+        if (*curr == next)
+        {
+                goto return_succp;
+        }
+        *curr = next;
+        succp = true;
+
+return_succp:
+        return succp;
+}
+
+
+
+bool ses_sescmd_proceed_nolock(
+        ses_command_t* sc)
+{
+        bool succp;
+        succp = ses_sescmd_proceed_to_nolock(sc, SES_CMD_INIT);
+        return succp;
+}
+
+bool ses_sescmd_proceed(
+        ses_command_t* sc)
+{
+        bool succp;
+
+        spinlock_acquire(&sc->ses_cmd_lock);
+        succp = ses_sescmd_proceed_nolock(sc);
+        spinlock_release(&sc->ses_cmd_lock);
+        return succp;
+}
+
+void ses_sescmd_lock(
+        ses_command_t* sc)
+{
+        CHK_SES_CMD(sc);
+        spinlock_acquire(&sc->ses_cmd_lock);
+}
+
+void ses_sescmd_unlock(
+        ses_command_t* sc)
+{
+        CHK_SES_CMD(sc);
+        spinlock_release(&sc->ses_cmd_lock);
+}
+
+bool ses_sescmd_proceed_due(
+        ses_command_t*  sc,
+        ses_cmd_event_t ev)
+{
+        bool succp;
+        
+        CHK_SES_CMD(sc);
+        spinlock_acquire(&sc->ses_cmd_lock);
+
+        succp = ses_sescmd_proceed_due_nolock(sc, ev);
+        
+        spinlock_release(&sc->ses_cmd_lock);
+        return succp;
+}
+
+bool ses_sescmd_proceed_due_nolock(
+        ses_command_t*  sc,
+        ses_cmd_event_t ev)
+{
+        bool            succp = true;
+        ses_cmd_state_t curr = sc->ses_cmd_state;
+        
+        CHK_SES_CMD(sc);
+
+        switch (curr) {
+        case SES_CMD_SENDING:
+                if (ev == SES_CMD_EV_SENT)
+                {
+                        sc->ses_cmd_state = SES_CMD_SENT;
+                }
+                else if (ev == SES_CMD_EV_REPLIED)
+                {
+                        sc->ses_cmd_state = SES_CMD_REPLIED_WHILE_SENDING;
+                }
+                else
+                {
+                        succp = false;
+                }
+                break;
+        default:
+                sc->ses_cmd_state = ses_sescmd_get_next_state(curr);
+                succp = true;
+                break;
+        } /* switch */
+        
+        return succp;
+}
+
+
+#endif /* SES_CMD */

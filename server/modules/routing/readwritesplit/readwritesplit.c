@@ -462,7 +462,7 @@ static int routeQuery(
         GWBUF*  querybuf)
 {
         skygw_query_type_t qtype    = QUERY_TYPE_UNKNOWN;
-        char*              querystr = NULL;
+        char*              querystr = NULL; /**< can be optimized by cloning GWBUF instead */
         char*              startpos;
         size_t             len;
         unsigned char      packet_type;
@@ -474,6 +474,12 @@ static int routeQuery(
         ROUTER_INSTANCE*   inst = (ROUTER_INSTANCE *)instance;
         ROUTER_CLIENT_SES* router_cli_ses = (ROUTER_CLIENT_SES *)router_session;
         bool               rses_is_closed;
+#if defined(SES_CMD)
+        ses_command_t*     sescmd;
+#endif
+#if defined(SES_CMD2)
+        bool               session_update = FALSE;
+#endif
 
         CHK_CLIENT_RSES(router_cli_ses);
                 
@@ -594,7 +600,20 @@ static int routeQuery(
 
         case QUERY_TYPE_SESSION_WRITE:
                 /**
-                 * Update connections which are used in this session.
+                 * Execute in backends used by this MaxScale session. In addition
+                 * save the command for replay in backends which are started and
+                 * joined later.
+                 *
+                 * Session variable command is implemented as an object with 
+                 * following states:
+                 *  INIT - command object is created
+                 *  SAVED - command is added to session's cmd history list.
+                 *          Backends started in this state or later will the
+                 *          command from history list.
+                 *  SENDING - started to send cmd to all session's backends
+                 *  REPLIED_WHILE_SENDING - backend sent reply but sending is active
+                 *  SENT - cmd is sent to all backends, waiting for reply
+                 *  SENT_AND_REPLIED - cmd was sent and at least one reply arrived
                  *
                  * For each connection updated, add a flag which indicates that
                  * OK Packet must arrive for this command before server
@@ -651,16 +670,65 @@ static int routeQuery(
                                 NULL,
                                 master_dcb->session,
                                 bufcopy);
+#if defined(SES_CMD2)
+                        /**
+                         * This command must be remembered and executed in new
+                         * backends before clients can access them.
+                         */
+                        session_update = TRUE;
+#endif
                         break;
 
                 case COM_QUERY:
+#if defined(SES_CMD)
+                        /** create session command object, clone querystr for it */
+                        sescmd = ses_command_init(DCB_SESSION(master_dcb),
+                                                  gwbuf_clone(querybuf));
+                        
+                        if (sescmd == NULL)
+                        {
+                                LOGIF(LE, (skygw_log_write_flush(
+                                                   LOGFILE_ERROR,
+                                                   "Error : Failed to create session "
+                                                   "command object. Aborting router.")));
+                                goto return_ret;
+                        }
+                        ss_dassert(sescmd->ses_cmd_state == SES_CMD_INIT);
+                        /** add cmd to session's command list */
+                        ses_add_sescmd(sescmd);
+                        ss_dassert(sescmd->ses_cmd_state == SES_CMD_SAVED);
+                        /** move to next state of ses command */
+                        ses_sescmd_proceed(sescmd);
+                        ss_dassert(sescmd->ses_cmd_state == SES_CMD_SENDING);
+                        /**
+                         * Add sescmd pointer to both backend dcbs and to client dcb.
+                         * Pointer is removed in when reply is sent to client.
+                         */
+                        dcb_add_sescmd(master_dcb, sescmd);
+                        dcb_add_sescmd(slave_dcb, sescmd);
+                        dcb_add_sescmd(master_dcb->session->client, sescmd);
+
+                        /** execute session commands in current backends */
                         ret = master_dcb->func.session(master_dcb, (void *)querybuf);
                         slave_dcb->func.session(slave_dcb, (void *)bufcopy);
+                        ss_dassert(sescmd->ses_cmd_state == SES_CMD_REPLIED_WHILE_SENDING ||
+                                sescmd->ses_cmd_state == SES_CMD_SENDING);
+                        
+                        /** move to next state of ses command */
+                        ses_sescmd_proceed_due(sescmd, SES_CMD_EV_SENT);
+#endif /* SES_CMD */
                         break;
 
                 default:
                         ret = master_dcb->func.session(master_dcb, (void *)querybuf);
                         slave_dcb->func.session(slave_dcb, (void *)bufcopy);
+#if 0
+                        /**
+                         * This command must be remembered and executed in new
+                         * backends before clients can access them.
+                         */
+                        session_update = TRUE;
+#endif
                         break;
                 } /**< switch by packet type */
 
@@ -687,6 +755,15 @@ static int routeQuery(
         } /**< switch by query type */
 
 return_ret:
+#if defined(SES_CMD2)
+        /**
+         * Add session update command to list of cmds in session object.
+         */
+        if (session_update)
+        {
+                session_add_sescmd(...);
+        }
+#endif
         free(querystr);
         return ret;
 }
@@ -831,6 +908,46 @@ static void clientReply(
 
                 client_dcb = backend_dcb->session->client;
                 
+#if defined(SES_CMD)
+                /**
+                 * client connection has been reset/disappeared/etc.
+                 */
+                if (client_dcb == NULL)
+                {
+                    /* consume the gwbuf without writing to client */
+                    gwbuf_consume(writebuf, gwbuf_length(writebuf));
+                }
+                /**
+                 * backend dcb is replying result from session variable update.
+                 */
+                else if (dcb_is_replying_sescmd(backend_dcb))
+                {
+                        ses_command_t* sc = backend_dcb->dcb_sescmd;
+
+                        CHK_SES_CMD(sc);
+                        
+                        ses_sescmd_lock(sc);
+
+                        /** this is a session command which hasn't been replied yet */
+                        if (dcb_sescmd_can_be_replied(backend_dcb))
+                        {
+                                /*
+                                ss_dassert(backend_dcb->dcb_sescmd == client_dcb->dcb_sescmd);
+                                */
+                                client_dcb->func.write(client_dcb, writebuf);
+                                
+                                /** Shange state as a consequence of reply event */
+                                ses_sescmd_proceed_due_nolock(sc, SES_CMD_EV_REPLIED);
+                        }
+                        else
+                        {
+                                /** consume the gwbuf since there's no client to write to */
+                                gwbuf_consume(writebuf, gwbuf_length(writebuf));
+                        }
+                        dcb_remove_sescmd(backend_dcb);
+                        ses_sescmd_unlock(sc);
+                }
+#else
                 if (backend_dcb != NULL &&
                     backend_dcb->command == ROUTER_CHANGE_SESSION)
                 {
@@ -844,6 +961,11 @@ static void clientReply(
                                 gwbuf_consume(writebuf, gwbuf_length(writebuf));
                         }
                 }
+#endif /* SES_CMD */
+                /**
+                 * Reply is coming from one backend dcb and will be passed to
+                 * client dcb.
+                 */
                 else if (client_dcb != NULL)
                 {
                         /* normal flow */

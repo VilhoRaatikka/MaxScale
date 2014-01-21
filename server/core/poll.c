@@ -378,8 +378,10 @@ poll_waitevents(void *arg)
                                                 LOGIF(LD, (skygw_log_write(
                                                         LOGFILE_DEBUG,
                                                         "%lu [poll_waitevents] "
-                                                        "EPOLLERR due %d, %s.",
+                                                        "EPOLLERR to dcb %p fd %d, due %d, %s.",
                                                         pthread_self(),
+                                                        dcb,
+                                                        dcb->fd,
                                                         eno,
                                                         strerror(eno))));
                                         }

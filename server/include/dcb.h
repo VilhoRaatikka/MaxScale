@@ -17,6 +17,9 @@
  *
  * Copyright SkySQL Ab 2013
  */
+
+
+#include <session.h>
 #include <spinlock.h>
 #include <buffer.h>
 #include <gwbitmask.h>
@@ -182,6 +185,9 @@ typedef struct dcb {
 	void		*data;		/**< Specific client data */
 	DCBMM		memdata;	/**< The data related to DCB memory management */
 	int		command;	/**< Specific client command type */
+#if defined(SES_CMD)
+        ses_command_t   *dcb_sescmd;    /**< session variable command pointer */
+#endif
 #if defined(SS_DEBUG)
         skygw_chk_t     dcb_chk_tail;
 #endif
@@ -220,6 +226,12 @@ void		dcb_printf(DCB *, const char *, ...);	/* DCB version of printf */
 int		dcb_isclient(DCB *);			/* the DCB is the client of the session */
 void		dcb_hashtable_stats(DCB *, void *);	/**< Print statisitics */
 void            dcb_add_to_zombieslist(DCB* dcb);
+#if defined(SES_CMD)
+bool            dcb_add_sescmd(DCB* dcb, ses_command_t* sescmd);
+bool            dcb_remove_sescmd(DCB* dcb);
+bool            dcb_sescmd_can_be_replied(DCB* dcb);
+bool            dcb_is_replying_sescmd(DCB* dcb);
+#endif
 
 bool dcb_set_state(
         DCB*         dcb,
