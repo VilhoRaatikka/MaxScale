@@ -42,10 +42,15 @@
 #include <skygw_utils.h>
 #include <skygw_debug.h>
 #include <log_manager.h>
+
 extern int lm_enabled_logfiles_bitmask;
 
 static SPINLOCK	session_spin = SPINLOCK_INIT;
 static SESSION	*allSessions = NULL;
+
+#if defined(SES_CMD)
+static void ses_sescmds_free(SESSION* session);
+#endif
 
 /**
  * Allocate a new session for a new client of the specified service.
@@ -261,6 +266,9 @@ bool session_free(
                         session->service->router_instance,
                         session->router_session);
         }
+#if defined(SES_CMD)
+        ses_sescmds_free(session);
+#endif
 	free(session);
         succp = true;
         
@@ -533,6 +541,37 @@ void ses_add_sescmd(
         spinlock_release(&sc->ses_cmd_session->ses_lock);
 }
 
+
+/** 
+ * @node Frees session variable command structures which
+ * are stored to session struct.
+ *
+ * @return void
+ *
+ * 
+ * @details Go through the list of sessoin varibale commands and free
+ * each of them.
+ *
+ */
+static void ses_sescmds_free(
+        SESSION* session)
+{
+        ses_command_t* sc; 
+        ses_command_t* next;
+
+        CHK_SESSION(session);
+        sc = session->ses_sesvar_cmds;
+        session->ses_sesvar_cmds = NULL;
+
+        while (sc != NULL)
+        {
+                CHK_SES_CMD(sc);
+                ss_dassert(sc->ses_cmd_state == SES_CMD_SENT_AND_REPLIED);
+                next = sc->ses_cmd_next;
+                free(sc);
+                sc = next;
+        }        
+}
 
 ses_cmd_state_t ses_sescmd_get_next_state(
         ses_cmd_state_t curr_state)

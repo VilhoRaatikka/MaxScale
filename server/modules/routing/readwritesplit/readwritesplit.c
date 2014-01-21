@@ -477,10 +477,6 @@ static int routeQuery(
 #if defined(SES_CMD)
         ses_command_t*     sescmd;
 #endif
-#if defined(SES_CMD2)
-        bool               session_update = FALSE;
-#endif
-
         CHK_CLIENT_RSES(router_cli_ses);
                 
         inst->stats.n_queries++;
@@ -600,45 +596,23 @@ static int routeQuery(
 
         case QUERY_TYPE_SESSION_WRITE:
                 /**
-                 * Execute in backends used by this MaxScale session. In addition
-                 * save the command for replay in backends which are started and
-                 * joined later.
+                 * Execute in backends used by the current MaxScale session.
+                 * Save session variable commands to session struct. Thus, they
+                 * can be replayed in backends which are started and joined later.
                  *
                  * Session variable command is implemented as an object with 
                  * following states:
-                 *  INIT - command object is created
-                 *  SAVED - command is added to session's cmd history list.
+                 *  SES_CMD_INIT - command object is created
+                 *  SES_CMD_SAVED - command is added to session's cmd history list.
                  *          Backends started in this state or later will the
                  *          command from history list.
-                 *  SENDING - started to send cmd to all session's backends
-                 *  REPLIED_WHILE_SENDING - backend sent reply but sending is active
-                 *  SENT - cmd is sent to all backends, waiting for reply
-                 *  SENT_AND_REPLIED - cmd was sent and at least one reply arrived
+                 *  SES_CMD_SENDING - started to send cmd to session's backends
+                 *  SES_CMD_REPLIED_WHILE_SENDING - backend sent reply but sending is active
+                 *  SES_CMD_SENT - cmd is sent to all backends, waiting for reply
+                 *  SES_CMD_SENT_AND_REPLIED - cmd was sent and at least one reply arrived
                  *
-                 * For each connection updated, add a flag which indicates that
-                 * OK Packet must arrive for this command before server
-                 * in question is allowed to be used by router. That is,
-                 * maintain a queue of pending OK packets and remove item
-                 * from queue by FIFO.
-                 * 
-                 * Return when the master responds OK Packet. Send that
-                 * OK packet back to client.
-                 * 
                  * Suppress OK packets sent to MaxScale by slaves.
                  *
-                 * Open questions:
-                 * How to handle interleaving session write
-                 * and queries? It would be simple if OK must be received
-                 * from all/both servers before continuing query execution.
-                 * How to maintain the order of operations? Execution queue
-                 * would solve the problem. In the queue some things must be
-                 * executed in serialized manner while some could be executed
-                 * in parallel. Queries mostly.
-                 * 
-                 * Instead of waiting for the OK packet from the master, the
-                 * first OK packet could also be sent to client. TBD.
-                 * vraa 9.12.13
-                 * 
                  */
                 LOGIF(LT, (skygw_log_write(
                                    LOGFILE_TRACE,
@@ -670,13 +644,6 @@ static int routeQuery(
                                 NULL,
                                 master_dcb->session,
                                 bufcopy);
-#if defined(SES_CMD2)
-                        /**
-                         * This command must be remembered and executed in new
-                         * backends before clients can access them.
-                         */
-                        session_update = TRUE;
-#endif
                         break;
 
                 case COM_QUERY:
@@ -707,10 +674,11 @@ static int routeQuery(
                         dcb_add_sescmd(master_dcb, sescmd);
                         dcb_add_sescmd(slave_dcb, sescmd);
                         dcb_add_sescmd(master_dcb->session->client, sescmd);
-
+#endif /* SES_CMD */
                         /** execute session commands in current backends */
                         ret = master_dcb->func.session(master_dcb, (void *)querybuf);
                         slave_dcb->func.session(slave_dcb, (void *)bufcopy);
+#if defined(SES_CMD)
                         ss_dassert(sescmd->ses_cmd_state == SES_CMD_REPLIED_WHILE_SENDING ||
                                 sescmd->ses_cmd_state == SES_CMD_SENDING);
                         
@@ -722,13 +690,6 @@ static int routeQuery(
                 default:
                         ret = master_dcb->func.session(master_dcb, (void *)querybuf);
                         slave_dcb->func.session(slave_dcb, (void *)bufcopy);
-#if 0
-                        /**
-                         * This command must be remembered and executed in new
-                         * backends before clients can access them.
-                         */
-                        session_update = TRUE;
-#endif
                         break;
                 } /**< switch by packet type */
 
@@ -744,10 +705,6 @@ static int routeQuery(
                                    pthread_self(),
                                    STRQTYPE(qtype))));
                 
-                /**
-                 * Is this really ok?
-                 * What is not known is routed to master.
-                 */
                 ret = master_dcb->func.write(master_dcb, querybuf);
                 atomic_add(&inst->stats.n_master, 1);
                 goto return_ret;
@@ -755,15 +712,6 @@ static int routeQuery(
         } /**< switch by query type */
 
 return_ret:
-#if defined(SES_CMD2)
-        /**
-         * Add session update command to list of cmds in session object.
-         */
-        if (session_update)
-        {
-                session_add_sescmd(...);
-        }
-#endif
         free(querystr);
         return ret;
 }
